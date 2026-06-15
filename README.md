@@ -14,16 +14,34 @@ showing which paychecks those payments hit.
 - Confirmation UI where users accept, edit, or ignore detected payments.
 - Manual fallback for missing payments.
 - Payday setup and Paycheck Map for accepted or edited detections.
+- Supabase email/password auth.
+- Saved income schedule, import batches, detected payments, and reviewed statuses.
 - Strict JSON preview for the extraction output shape.
-- Initial Supabase schema migration for import batches and detected payments.
+- Supabase migrations for app tables, import batches, detected payments, and
+  private import-file storage policies.
 
 PDF and screenshot upload are wired in the UI, but real OCR and LLM extraction
 still need the server pipeline.
 
+## Supabase setup
+
+Run migrations in order from `supabase/migrations`:
+
+1. `0001_initial_billbrake_scan.sql`
+2. `0002_import_storage_policies.sql`
+
+Create `.env.local` for local development:
+
+```bash
+NEXT_PUBLIC_SUPABASE_URL=your_project_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
+```
+
+The `imports` storage bucket must be private. The second migration creates it
+if it does not already exist and adds user-folder policies.
+
 ## Next build steps
 
-- Add Supabase Auth and persistence.
-- Store uploaded files and import batches.
 - Add server text extraction for PDF/image sources.
 - Add LLM parsing with strict JSON validation.
 - Convert accepted detections into obligations and generated instances.

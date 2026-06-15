@@ -5,20 +5,34 @@ import {
   CheckCircle2,
   Clipboard,
   Clock3,
+  Database,
   FileText,
+  LoaderCircle,
+  LogOut,
   Mail,
   Pencil,
   Plus,
   ReceiptText,
   RefreshCcw,
+  Save,
   ScanLine,
   ShieldCheck,
   Trash2,
   Upload,
+  UserRound,
   WalletCards,
   XCircle,
 } from "lucide-react";
-import { ChangeEvent, FormEvent, ReactNode, useMemo, useState } from "react";
+import { Session } from "@supabase/supabase-js";
+import {
+  ChangeEvent,
+  FormEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import {
   DetectedPayment,
   ImportSourceType,
@@ -40,6 +54,12 @@ import {
   toISODate,
   IncomeSchedule,
 } from "@/lib/billbrake";
+import {
+  ensureAppUser,
+  loadBillBrakeState,
+  saveBillBrakeState,
+} from "@/lib/billbrake-persistence";
+import { supabase } from "@/lib/supabase";
 
 const sourceOptions: {
   value: ImportSourceType;
@@ -101,6 +121,18 @@ export function BillBrakeScanApp() {
   );
   const [fileName, setFileName] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const [session, setSession] = useState<Session | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authMode, setAuthMode] = useState<"sign-in" | "sign-up">("sign-up");
+  const [authStatus, setAuthStatus] = useState("");
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isDataLoading, setIsDataLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("Sign in to save scans.");
+  const [incomeScheduleId, setIncomeScheduleId] = useState<string | null>(null);
+  const [importBatchId, setImportBatchId] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
   const paycheckMap = useMemo(
     () => buildPaycheckMap(income, detectedPayments, todayISO),
@@ -116,11 +148,95 @@ export function BillBrakeScanApp() {
   const ignoredCount = detectedPayments.filter(
     (payment) => payment.reviewStatus === "ignored",
   ).length;
+  const signedInUser = session?.user ?? null;
+
+  const loadSavedDataForUser = useCallback(async (user: Session["user"]) => {
+    setIsDataLoading(true);
+    setSaveStatus("Loading saved data...");
+
+    try {
+      await ensureAppUser(user);
+      const loaded = await loadBillBrakeState(user.id);
+
+      if (loaded.income) {
+        setIncome(loaded.income);
+        setIncomeScheduleId(loaded.incomeScheduleId);
+      }
+
+      if (loaded.importBatch) {
+        setImportBatchId(loaded.importBatch.id);
+        setSourceType(loaded.importBatch.source_type);
+        setRawText(loaded.importBatch.raw_text ?? "");
+        setFileName(loaded.importBatch.original_filename ?? "saved-import");
+        setSelectedFile(null);
+        setDetectedPayments(loaded.detectedPayments);
+        setStatus(
+          loaded.detectedPayments.length
+            ? `Loaded ${loaded.detectedPayments.length} saved detected payment${
+                loaded.detectedPayments.length === 1 ? "" : "s"
+              }.`
+            : "Loaded your latest saved import batch.",
+        );
+      } else {
+        setStatus("Signed in. Start a scan or try sample data.");
+      }
+
+      setSaveStatus("Signed in. Changes are ready to save.");
+    } catch (error) {
+      setSaveStatus(error instanceof Error ? error.message : "Load failed.");
+    } finally {
+      setIsDataLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) {
+        return;
+      }
+
+      setSession(data.session);
+      setIsAuthLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      setIsAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    const user = session?.user;
+
+    if (!user) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void loadSavedDataForUser(user);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [loadSavedDataForUser, session]);
 
   function runSampleScan() {
     setDetectedPayments(createSampleDetections(todayISO));
     setFileName("sample-scan.txt");
+    setSelectedFile(null);
+    setImportBatchId(null);
     setStatus("We found 5 possible payments. Review them before saving.");
+    markUnsaved();
   }
 
   function runPasteImport(event: FormEvent<HTMLFormElement>) {
@@ -128,6 +244,8 @@ export function BillBrakeScanApp() {
     const detections = parseImportedText(rawText, sourceType);
     setDetectedPayments(detections);
     setFileName(sourceType === "csv" ? "pasted.csv" : "pasted-text.txt");
+    setSelectedFile(null);
+    setImportBatchId(null);
     setStatus(
       detections.length
         ? `We found ${detections.length} possible payment${
@@ -135,6 +253,7 @@ export function BillBrakeScanApp() {
           }. Review them before saving.`
         : "No likely payments found. Try sample scan or paste more detail.",
     );
+    markUnsaved();
   }
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -145,6 +264,8 @@ export function BillBrakeScanApp() {
     }
 
     setFileName(file.name);
+    setSelectedFile(file);
+    setImportBatchId(null);
     const lowerName = file.name.toLowerCase();
 
     if (
@@ -158,6 +279,7 @@ export function BillBrakeScanApp() {
         text,
         lowerName.endsWith(".csv") ? "csv" : "pasted_text",
       );
+      setRawText(text);
       setDetectedPayments(detections);
       setStatus(
         detections.length
@@ -166,12 +288,14 @@ export function BillBrakeScanApp() {
             }.`
           : `Processed ${file.name}, but no likely payments were found.`,
       );
+      markUnsaved();
       return;
     }
 
     setStatus(
       `${file.name} is staged. PDF and screenshot OCR need the server extraction pipeline; use sample scan or paste text in this prototype.`,
     );
+    markUnsaved();
   }
 
   function updatePayment(id: string, patch: Partial<DetectedPayment>) {
@@ -187,6 +311,7 @@ export function BillBrakeScanApp() {
           : payment,
       ),
     );
+    markUnsaved();
   }
 
   function addManualPayment() {
@@ -205,6 +330,7 @@ export function BillBrakeScanApp() {
         reviewStatus: "edited",
       },
     ]);
+    markUnsaved();
   }
 
   function acceptAllPending() {
@@ -215,12 +341,16 @@ export function BillBrakeScanApp() {
           : payment,
       ),
     );
+    markUnsaved();
   }
 
   function resetImport() {
     setDetectedPayments([]);
     setFileName("");
+    setSelectedFile(null);
+    setImportBatchId(null);
     setStatus("Drop in a file, paste text, or try a sample scan.");
+    markUnsaved();
   }
 
   async function copyForwardingAddress() {
@@ -230,6 +360,96 @@ export function BillBrakeScanApp() {
 
   function updateIncome(patch: Partial<IncomeSchedule>) {
     setIncome((current) => ({ ...current, ...patch }));
+    markUnsaved();
+  }
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthStatus(authMode === "sign-up" ? "Creating account..." : "Signing in...");
+    setIsAuthLoading(true);
+
+    const authResult =
+      authMode === "sign-up"
+        ? await supabase.auth.signUp({
+            email: authEmail,
+            password: authPassword,
+          })
+        : await supabase.auth.signInWithPassword({
+            email: authEmail,
+            password: authPassword,
+          });
+
+    setIsAuthLoading(false);
+
+    if (authResult.error) {
+      setAuthStatus(authResult.error.message);
+      return;
+    }
+
+    if (authResult.data.session) {
+      setAuthStatus("Signed in.");
+      return;
+    }
+
+    setAuthStatus("Check your email if confirmation is enabled.");
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut();
+    setSession(null);
+    setIncomeScheduleId(null);
+    setImportBatchId(null);
+    setSaveStatus("Sign in to save scans.");
+  }
+
+  async function handleLoadSavedData() {
+    if (!signedInUser) {
+      setSaveStatus("Sign in first.");
+      return;
+    }
+
+    setIsDataLoading(true);
+    setSaveStatus("Loading saved data...");
+
+    await loadSavedDataForUser(signedInUser);
+  }
+
+  async function handleSaveState() {
+    if (!signedInUser) {
+      setSaveStatus("Sign in first.");
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveStatus("Saving to Supabase...");
+
+    try {
+      const saved = await saveBillBrakeState({
+        user: signedInUser,
+        income,
+        incomeScheduleId,
+        sourceType,
+        originalFilename: fileName || selectedFile?.name || null,
+        rawText,
+        selectedFile,
+        importBatchId,
+        detectedPayments,
+      });
+      setIncomeScheduleId(saved.incomeScheduleId);
+      setImportBatchId(saved.importBatchId);
+      setSelectedFile(null);
+      setSaveStatus("Saved to Supabase.");
+    } catch (error) {
+      setSaveStatus(error instanceof Error ? error.message : "Save failed.");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function markUnsaved() {
+    if (signedInUser) {
+      setSaveStatus("Unsaved changes.");
+    }
   }
 
   return (
@@ -253,6 +473,10 @@ export function BillBrakeScanApp() {
               Paycheck Map
             </a>
           </nav>
+          <div className="hidden items-center gap-2 text-sm text-[#50594a] lg:flex">
+            <UserRound aria-hidden="true" size={16} />
+            <span>{signedInUser?.email ?? "Not signed in"}</span>
+          </div>
         </div>
       </header>
 
@@ -405,6 +629,64 @@ export function BillBrakeScanApp() {
             </div>
 
             <aside className="space-y-6">
+              <AuthPanel
+                email={authEmail}
+                password={authPassword}
+                mode={authMode}
+                status={authStatus}
+                session={session}
+                isLoading={isAuthLoading}
+                onEmailChange={setAuthEmail}
+                onPasswordChange={setAuthPassword}
+                onModeChange={setAuthMode}
+                onSubmit={handleAuthSubmit}
+                onSignOut={handleSignOut}
+              />
+
+              <Panel title="Database" icon={<Database size={18} />}>
+                <div className="space-y-3">
+                  <p className="text-sm leading-6 text-[#586451]">
+                    {saveStatus}
+                  </p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={handleSaveState}
+                      disabled={!signedInUser || isSaving}
+                      className={primaryButtonClassName}
+                    >
+                      {isSaving ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="animate-spin"
+                          size={17}
+                        />
+                      ) : (
+                        <Save aria-hidden="true" size={17} />
+                      )}
+                      Save scan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleLoadSavedData}
+                      disabled={!signedInUser || isDataLoading}
+                      className={secondaryButtonClassName}
+                    >
+                      {isDataLoading ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="animate-spin"
+                          size={17}
+                        />
+                      ) : (
+                        <RefreshCcw aria-hidden="true" size={17} />
+                      )}
+                      Load
+                    </button>
+                  </div>
+                </div>
+              </Panel>
+
               <Panel title="Payday setup" icon={<Clock3 size={18} />}>
                 <div className="space-y-4">
                   <div className="grid grid-cols-2 gap-2">
@@ -639,6 +921,128 @@ function ImportPanel({
         </form>
       </div>
     </section>
+  );
+}
+
+function AuthPanel({
+  email,
+  password,
+  mode,
+  status,
+  session,
+  isLoading,
+  onEmailChange,
+  onPasswordChange,
+  onModeChange,
+  onSubmit,
+  onSignOut,
+}: {
+  email: string;
+  password: string;
+  mode: "sign-in" | "sign-up";
+  status: string;
+  session: Session | null;
+  isLoading: boolean;
+  onEmailChange: (email: string) => void;
+  onPasswordChange: (password: string) => void;
+  onModeChange: (mode: "sign-in" | "sign-up") => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSignOut: () => void;
+}) {
+  if (session?.user) {
+    return (
+      <Panel title="Account" icon={<UserRound size={18} />}>
+        <div className="space-y-3">
+          <div className="rounded-lg border border-[#dfe6d8] bg-[#fbfcf8] p-3">
+            <p className="text-xs font-semibold uppercase tracking-normal text-[#65715f]">
+              Signed in
+            </p>
+            <p className="mt-1 truncate text-sm font-semibold">
+              {session.user.email}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onSignOut}
+            className={secondaryButtonClassName}
+          >
+            <LogOut aria-hidden="true" size={17} />
+            Sign out
+          </button>
+        </div>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title="Account" icon={<UserRound size={18} />}>
+      <form onSubmit={onSubmit} className="space-y-3">
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => onModeChange("sign-up")}
+            className={`h-10 rounded-lg border px-3 text-sm font-semibold transition ${
+              mode === "sign-up"
+                ? "border-[#141711] bg-[#141711] text-white"
+                : "border-[#c5cdbb] bg-white text-[#4e5948] hover:border-[#899778]"
+            }`}
+          >
+            Create account
+          </button>
+          <button
+            type="button"
+            onClick={() => onModeChange("sign-in")}
+            className={`h-10 rounded-lg border px-3 text-sm font-semibold transition ${
+              mode === "sign-in"
+                ? "border-[#141711] bg-[#141711] text-white"
+                : "border-[#c5cdbb] bg-white text-[#4e5948] hover:border-[#899778]"
+            }`}
+          >
+            Sign in
+          </button>
+        </div>
+        <Field label="Email">
+          <input
+            type="email"
+            required
+            value={email}
+            onChange={(event) => onEmailChange(event.target.value)}
+            className={inputClassName}
+            placeholder="you@example.com"
+          />
+        </Field>
+        <Field label="Password">
+          <input
+            type="password"
+            required
+            minLength={6}
+            value={password}
+            onChange={(event) => onPasswordChange(event.target.value)}
+            className={inputClassName}
+            placeholder="At least 6 characters"
+          />
+        </Field>
+        <button
+          type="submit"
+          disabled={isLoading}
+          className={primaryButtonClassName}
+        >
+          {isLoading ? (
+            <LoaderCircle aria-hidden="true" className="animate-spin" size={17} />
+          ) : (
+            <UserRound aria-hidden="true" size={17} />
+          )}
+          {mode === "sign-up" ? "Create account" : "Sign in"}
+        </button>
+        {status ? (
+          <p className="text-xs leading-5 text-[#65715f]">{status}</p>
+        ) : (
+          <p className="text-xs leading-5 text-[#65715f]">
+            Sign in to persist scans, payday settings, and reviewed detections.
+          </p>
+        )}
+      </form>
+    </Panel>
   );
 }
 
